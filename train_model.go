@@ -1,139 +1,120 @@
 package main
 
 import (
+	"bytes"
+	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/sagemaker"
+	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/sajari/regression"
 )
 
+// S3 Configuration
 const (
-	bucketName    = "sage-bilguun"
-	fileKey       = "train/energy_test_illinois.csv"
-	roleArn       = "arn:aws:iam::867344430132:role/service-role/AmazonSageMaker-ExecutionRole-20250302T162596"
-	region        = "us-east-1"
-	modelOutputS3 = "s3://sage-bilguun/model/"
-	trainImageUri = "683313688378.dkr.ecr.us-east-1.amazonaws.com/xgboost:latest"
-	instanceType  = "ml.m5.large"
-	jobName       = "energy-forecast-training-job"
-	endpointName  = "energy-forecast-endpoint"
+	region     = "us-east-1"
+	bucketName = "sage-bilguun"
+	fileKey    = "train/energy_test_illinois.csv"
 )
 
-// Function to Start a SageMaker Training Job
-func startTrainingJob(sess *session.Session) error {
-	svc := sagemaker.New(sess)
-
-	inputDataConfig := []*sagemaker.Channel{
-		{
-			ChannelName: aws.String("train"),
-			DataSource: &sagemaker.DataSource{
-				S3DataSource: &sagemaker.S3DataSource{
-					S3DataType: aws.String("S3Prefix"),
-					S3Uri:      aws.String("s3://" + bucketName + "/train/"),
-				},
-			},
-			ContentType: aws.String("csv"),
-		},
-	}
-
-	trainingParams := &sagemaker.CreateTrainingJobInput{
-		TrainingJobName: aws.String(jobName),
-		AlgorithmSpecification: &sagemaker.AlgorithmSpecification{
-			TrainingImage:     aws.String(trainImageUri),
-			TrainingInputMode: aws.String("File"),
-		},
-		RoleArn:         aws.String(roleArn),
-		InputDataConfig: inputDataConfig,
-		OutputDataConfig: &sagemaker.OutputDataConfig{
-			S3OutputPath: aws.String(modelOutputS3),
-		},
-		ResourceConfig: &sagemaker.ResourceConfig{
-			InstanceType:   aws.String(instanceType),
-			InstanceCount:  aws.Int64(1),
-			VolumeSizeInGB: aws.Int64(10),
-		},
-		StoppingCondition: &sagemaker.StoppingCondition{
-			MaxRuntimeInSeconds: aws.Int64(3600),
-		},
-	}
-
-	_, err := svc.CreateTrainingJob(trainingParams)
+// Fetch Data from S3
+func fetchCSVFromS3() ([][]string, error) {
+	sess, err := session.NewSession(&aws.Config{Region: aws.String(region)})
 	if err != nil {
-		return fmt.Errorf("failed to create training job: %v", err)
+		return nil, fmt.Errorf("failed to start AWS session: %v", err)
 	}
 
-	fmt.Println("Training job started successfully:", jobName)
-	return nil
+	svc := s3.New(sess)
+	result, err := svc.GetObject(&s3.GetObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(fileKey),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch data from S3: %v", err)
+	}
+
+	// Read CSV content
+	buf := new(bytes.Buffer)
+	_, err = buf.ReadFrom(result.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read data: %v", err)
+	}
+
+	// Parse CSV
+	reader := csv.NewReader(buf)
+	records, err := reader.ReadAll()
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse CSV: %v", err)
+	}
+
+	return records, nil
 }
 
-// Function to Deploy the Model as an Endpoint
-func deployModel(sess *session.Session) error {
-	svc := sagemaker.New(sess)
+// Train the Model
+func trainModel(data [][]string) ([]float64, error) {
+	var r regression.Regression
+	r.SetObserved("Energy_KWh")
+	r.SetVar(0, "Population")
+	r.SetVar(1, "Temperature")
 
-	modelParams := &sagemaker.CreateModelInput{
-		ModelName: aws.String(endpointName),
-		PrimaryContainer: &sagemaker.ContainerDefinition{
-			Image:        aws.String(trainImageUri),
-			ModelDataUrl: aws.String(modelOutputS3 + jobName + "/output/model.tar.gz"),
-		},
-		ExecutionRoleArn: aws.String(roleArn),
+	// Skip header and train model
+	for i, row := range data {
+		if i == 0 {
+			continue // Skip header
+		}
+		var population, temperature, energy float64
+		fmt.Sscanf(row[1], "%f", &population)   // Convert to float
+		fmt.Sscanf(row[2], "%f", &temperature)  // Convert to float
+		fmt.Sscanf(row[3], "%f", &energy)       // Convert to float
+		r.Train(regression.DataPoint(energy, []float64{population, temperature}))
 	}
 
-	_, err := svc.CreateModel(modelParams)
+	r.Run() // Train Model
+	coefficients := r.GetCoeffs()
+
+	return coefficients, nil
+}
+
+// Save Model to JSON
+func saveModel(coefficients []float64) error {
+	file, err := os.Create("model.json")
 	if err != nil {
-		return fmt.Errorf("failed to create model: %v", err)
+		return fmt.Errorf("failed to save model: %v", err)
 	}
+	defer file.Close()
 
-	endpointConfigParams := &sagemaker.CreateEndpointConfigInput{
-		EndpointConfigName: aws.String(endpointName),
-		ProductionVariants: []*sagemaker.ProductionVariant{
-			{
-				VariantName:          aws.String("AllTraffic"),
-				ModelName:            aws.String(endpointName),
-				InstanceType:         aws.String(instanceType),
-				InitialInstanceCount: aws.Int64(1),
-			},
-		},
-	}
-
-	_, err = svc.CreateEndpointConfig(endpointConfigParams)
+	// Convert coefficients to JSON
+	modelData, err := json.MarshalIndent(coefficients, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to create endpoint config: %v", err)
+		return fmt.Errorf("failed to encode model data: %v", err)
 	}
 
-	endpointParams := &sagemaker.CreateEndpointInput{
-		EndpointName:       aws.String(endpointName),
-		EndpointConfigName: aws.String(endpointName),
-	}
-
-	_, err = svc.CreateEndpoint(endpointParams)
-	if err != nil {
-		return fmt.Errorf("failed to deploy model: %v", err)
-	}
-
-	fmt.Println("SageMaker Model Deployed at:", endpointName)
-	return nil
+	_, err = file.Write(modelData)
+	return err
 }
 
 func main() {
-	sess, err := session.NewSession(&aws.Config{
-		Region: aws.String(region),
-	})
+	fmt.Println("Fetching data from S3...")
+	data, err := fetchCSVFromS3()
 	if err != nil {
-		log.Fatalf("Failed to start AWS session: %v", err)
+		log.Fatalf("Error fetching CSV: %v", err)
 	}
 
-	fmt.Println("Starting SageMaker training job...")
-	err = startTrainingJob(sess)
+	fmt.Println("Training the model...")
+	coefficients, err := trainModel(data)
 	if err != nil {
-		log.Fatalf("Error in training job: %v", err)
+		log.Fatalf("Error training model: %v", err)
 	}
 
-	fmt.Println("Deploying trained model as endpoint...")
-	err = deployModel(sess)
+	fmt.Println("Saving trained model...")
+	err = saveModel(coefficients)
 	if err != nil {
-		log.Fatalf("Error deploying model: %v", err)
+		log.Fatalf("Error saving model: %v", err)
 	}
+
+	fmt.Println("✅ Model training complete. Model saved as model.json")
 }
