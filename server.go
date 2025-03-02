@@ -1,75 +1,63 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
+	"math"
 	"net/http"
 	"os"
 
 	"github.com/gin-gonic/gin"
 )
 
-const sagemakerEndpoint = "https://runtime.sagemaker.us-east-1.amazonaws.com/endpoints/energy-forecast-endpoint/invocations"
-
-// Request structure
+// PredictionRequest represents input JSON structure
 type PredictionRequest struct {
 	Population  float64 `json:"population"`
 	Temperature float64 `json:"temperature"`
 }
 
-// SageMaker Response Structure
-type SageMakerResponse struct {
-	Predictions [][]float64 `json:"predictions"`
+// PredictionResponse represents output JSON structure
+type PredictionResponse struct {
+	EnergyKWh float64 `json:"predicted_energy_kwh"`
 }
 
-// Predict Energy Consumption using SageMaker
-func predictWithSageMaker(population, temperature float64) (float64, error) {
-	payload := map[string]interface{}{
-		"instances": []map[string]float64{
-			{"population": population, "temperature": temperature},
-		},
-	}
-
-	jsonData, err := json.Marshal(payload)
+// Load Model Coefficients
+func loadModel() ([]float64, error) {
+	file, err := os.ReadFile("model.json")
 	if err != nil {
-		return 0, err
+		log.Printf("Error loading model file: %v", err)
+		return nil, err
 	}
 
-	req, err := http.NewRequest("POST", sagemakerEndpoint, bytes.NewBuffer(jsonData))
+	var coefficients []float64
+	err = json.Unmarshal(file, &coefficients)
 	if err != nil {
-		return 0, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	// Use IAM Role instead of hardcoded credentials
-	req.Header.Set("X-Amz-Target", "SageMaker.InvokeEndpoint")
-	req.Header.Set("Authorization", "AWS4-HMAC-SHA256") // IAM handles auth
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return 0, err
+		log.Printf("Error parsing model file: %v", err)
+		return nil, err
 	}
 
-	var sagemakerResponse SageMakerResponse
-	err = json.Unmarshal(body, &sagemakerResponse)
-	if err != nil {
-		return 0, err
-	}
-
-	return sagemakerResponse.Predictions[0][0], nil
+	return coefficients, nil
 }
 
-// API handler for predictions
+// Compute Energy Consumption Prediction
+func predictEnergy(population, temperature float64) float64 {
+	coeff, err := loadModel()
+	if err != nil {
+		log.Println("Failed to load model, returning default prediction")
+		return 1000
+	}
+
+	fmt.Println("Model Coefficients:", coeff)
+
+	// Apply regression formula
+	prediction := coeff[0] + (coeff[1] * population) + (coeff[2] * temperature)
+
+	// Ensure non-negative predictions
+	return math.Max(prediction, 0)
+}
+
+// API Endpoint for Predictions
 func predictHandler(c *gin.Context) {
 	var req PredictionRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -77,19 +65,15 @@ func predictHandler(c *gin.Context) {
 		return
 	}
 
-	energy, err := predictWithSageMaker(req.Population, req.Temperature)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate prediction"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"predicted_energy_kwh": energy})
+	energy := predictEnergy(req.Population, req.Temperature)
+	c.JSON(http.StatusOK, PredictionResponse{EnergyKWh: energy})
 }
 
+// Main function to start API
 func main() {
 	router := gin.Default()
 	router.POST("/predict", predictHandler)
 
-	fmt.Println("API Server is running on port 5000")
+	fmt.Println("✅ API Server is running on port 5000")
 	router.Run("0.0.0.0:5000")
 }
