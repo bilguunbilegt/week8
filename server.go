@@ -5,13 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"os"
 
 	"github.com/gin-gonic/gin"
 )
 
-const sagemakerEndpoint = "https://runtime.sagemaker.us-east-1.amazonaws.com/endpoints/xgboost-energy-forecast-2024-03-02/invocations"
+const sagemakerEndpoint = "https://runtime.sagemaker.us-east-1.amazonaws.com/endpoints/energy-forecast-endpoint/invocations"
 
 // Request structure
 type PredictionRequest struct {
@@ -42,7 +43,10 @@ func predictWithSageMaker(population, temperature float64) (float64, error) {
 		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+os.Getenv("AWS_AUTH_TOKEN"))
+
+	// Use IAM Role instead of hardcoded credentials
+	req.Header.Set("X-Amz-Target", "SageMaker.InvokeEndpoint")
+	req.Header.Set("Authorization", "AWS4-HMAC-SHA256") // IAM handles auth
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
